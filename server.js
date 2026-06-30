@@ -342,6 +342,7 @@ app.get('/teacher/classes', requireAuth, async (req, res) => {
         filteredCount: rawClasses.length,
         totalClassesChecked: allClasses.length,
         byTeacherIdsCount: byTeacherIds.length,
+        _rawSample: allClasses.length === 0 ? allRes : allClasses.slice(0, 2),
       },
     });
   } catch (e) {
