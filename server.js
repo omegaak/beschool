@@ -334,14 +334,14 @@ app.get('/teacher/classes', requireAuth, async (req, res) => {
 // Список сотрудников из МойКласс (чтобы админ выбрал manager_id, не вводя вслепую)
 app.get('/admin/managers', async (req, res) => {
   try {
-    const data = await mk('/managers', { limit: 100 });
-    const managers = (data.managers || []).map(m => ({
+    const raw = await mk('/managers', { limit: 100 });
+    const managers = (raw.managers || raw.data || (Array.isArray(raw) ? raw : []) || []).map(m => ({
       managerId: m.id,
       name: `${m.lastName || ''} ${m.firstName || ''}`.trim() || m.name || `#${m.id}`,
       email: m.email || null,
       phone: m.phone || null,
     }));
-    res.json({ ok: true, data: managers });
+    res.json({ ok: true, data: managers, _raw: managers.length === 0 ? raw : undefined });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
   }
