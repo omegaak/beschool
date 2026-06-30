@@ -238,7 +238,12 @@ app.get('/p/:token', async (req, res) => {
     const portfolio = await buildPortfolio(userId);
     res.json({ ok: true, data: portfolio });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+      detail: e.response?.data || null,
+      url: e.config?.url || null,
+    });
   }
 });
 
