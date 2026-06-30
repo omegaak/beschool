@@ -52,11 +52,47 @@ const LEVEL_ORDER = ['ABC','Beginner','Elementary','Pre-Int',
                      'Intermediate','Upper-Int','IELTS','Speaking'];
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
-const mk = (path, params = {}) =>
-  axios.get(`${MK_BASE}${path}`, {
-    headers: { 'x-api-key': MK_KEY },
+
+// МойКласс использует двухэтапную авторизацию:
+// 1) POST /v1/company/auth/getToken { apiKey } → { accessToken, expiresAt }
+// 2) Все остальные запросы — Authorization: Bearer <accessToken>
+let mkToken = null;       // { accessToken, expiresAt }
+let mkTokenPromise = null; // защита от параллельных запросов токена
+
+async function getMkToken() {
+  // Токен ещё действителен — переиспользуем (с запасом 60 сек)
+  if (mkToken && mkToken.expiresAt > Date.now() + 60_000) {
+    return mkToken.accessToken;
+  }
+  // Уже идёт получение токена — ждём тот же промис, не дублируем запрос
+  if (mkTokenPromise) return mkTokenPromise;
+
+  mkTokenPromise = axios.post('https://api.moyklass.com/v1/company/auth/getToken', {
+    apiKey: MK_KEY,
+  }).then(r => {
+    const { accessToken, expiresAt } = r.data;
+    mkToken = {
+      accessToken,
+      // expiresAt от МойКласс — ISO-строка либо unix; на всякий случай считаем +50 мин
+      expiresAt: expiresAt ? new Date(expiresAt).getTime() : Date.now() + 50 * 60_000,
+    };
+    mkTokenPromise = null;
+    return accessToken;
+  }).catch(err => {
+    mkTokenPromise = null;
+    throw err;
+  });
+
+  return mkTokenPromise;
+}
+
+const mk = async (path, params = {}) => {
+  const token = await getMkToken();
+  return axios.get(`${MK_BASE}${path}`, {
+    headers: { 'Authorization': `Bearer ${token}` },
     params,
   }).then(r => r.data);
+};
 
 function detectSkill(topic) {
   if (!topic) return null;
@@ -248,9 +284,20 @@ app.post('/admin/sync/:userId', async (req, res) => {
   }
 });
 
-// Healthcheck
-app.get('/health', (req, res) =>
-  res.json({ ok: true, version: '1.0', timestamp: new Date() }));
+// Healthcheck — также проверяет что МойКласс ключ валиден
+app.get('/health', async (req, res) => {
+  const base = { ok: true, version: '1.0', timestamp: new Date() };
+  try {
+    await getMkToken();
+    res.json({ ...base, moyklass: 'connected' });
+  } catch (e) {
+    res.json({
+      ...base,
+      moyklass: 'error',
+      moyklassError: e.response?.data || e.message,
+    });
+  }
+});
 
 app.listen(PORT, () =>
   console.log(`BE School Portfolio Backend running on :${PORT}`));
