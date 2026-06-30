@@ -127,19 +127,19 @@ async function buildPortfolio(userId) {
     const joinsRes = await mk('/joins', { user_id: userId, limit: 50 });
     const joins    = joinsRes.joins || [];
 
-    // Найти активную группу (последнюю по дате)
-    const activeJoin = joins
-      .filter(j => j.stats?.lastVisit || j.stats?.visits > 0)
-      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0]
-      || joins[0];
+    // Найти активную группу (по дате последнего реального посещения)
+    const withVisits = joins.filter(j => j.stats?.lastVisit);
+    const activeJoin = withVisits.length
+      ? withVisits.sort((a, b) => new Date(b.stats.lastVisit) - new Date(a.stats.lastVisit))[0]
+      : (joins.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0] || joins[0]);
 
     const courseId  = activeJoin?.courseId;
     const classId   = activeJoin?.classId;
     const level     = COURSE_LEVELS[courseId] || 'Elementary';
     const totalPaid = joins.reduce((s, j) => s + (j.stats?.totalPayed || 0), 0);
 
-    // 2. Оценки и посещаемость
-    const recordsRes = await mk('/lessonRecords', { user_id: userId, limit: 200 });
+    // 2. Оценки и посещаемость — только по активной группе
+    const recordsRes = await mk('/lessonRecords', { user_id: userId, class_id: classId, limit: 200 });
     const records    = recordsRes.lessonRecords || [];
 
     const visited = records.filter(r => r.visit);
