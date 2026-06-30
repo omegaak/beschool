@@ -89,7 +89,7 @@ async function getMkToken() {
 const mk = async (path, params = {}) => {
   const token = await getMkToken();
   return axios.get(`${MK_BASE}${path}`, {
-    headers: { 'Authorization': `Bearer ${token}` },
+    headers: { 'x-access-token': token },
     params,
   }).then(r => r.data);
 };
