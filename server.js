@@ -425,7 +425,7 @@ app.get('/class/:classId/students', async (req, res) => {
 
     // 2. Все отметки посещаемости по этой группе — считаем реальный % сами,
     // а не доверяем agregированной статистике МойКласс (она может быть неточной)
-    const recordsRes = await mk('/lessonRecords', { classId, limit: 1000 });
+    const recordsRes = await mk('/lessonRecords', { classId, limit: 500 });
     const records = Array.isArray(recordsRes) ? recordsRes : (recordsRes.lessonRecords || []);
 
     // Группируем по ученику: всего записей / посещено
