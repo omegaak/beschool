@@ -227,7 +227,152 @@ async function buildPortfolio(userId) {
   });
 }
 
+// ─── TEACHER AUTH (in-memory store — заменить на БД в продакшене) ──────────
+// Админ добавляет учителей здесь: email из МойКласс + managerId + свой PIN.
+// PIN — простой пароль который задаёт администратор, не связан с МойКласс паролем.
+let TEACHERS = [
+  // Пример — заполнить реальными данными через /admin/teachers
+  // { email: "nurgul@beschool.kg", managerId: 12345, pin: "1234", name: "Нургуль Асанова" },
+];
+
+function findTeacher(email, pin) {
+  const norm = (s) => (s || '').trim().toLowerCase();
+  return TEACHERS.find(t =>
+    norm(t.email) === norm(email) && t.pin === String(pin).trim()
+  );
+}
+
+// Простые токены сессии (in-memory). В продакшене — JWT с секретом.
+const sessions = new Map(); // sessionToken → { email, managerId, name, createdAt }
+
+function createSession(teacher) {
+  const token = crypto.randomBytes(24).toString('hex');
+  sessions.set(token, { ...teacher, createdAt: Date.now() });
+  return token;
+}
+
+function getSession(token) {
+  const s = sessions.get(token);
+  if (!s) return null;
+  // Сессия живёт 30 дней
+  if (Date.now() - s.createdAt > 30 * 24 * 60 * 60 * 1000) {
+    sessions.delete(token);
+    return null;
+  }
+  return s;
+}
+
+// Middleware: проверка авторизации учителя
+function requireAuth(req, res, next) {
+  const token = req.headers['x-session-token'];
+  const session = token ? getSession(token) : null;
+  if (!session) {
+    return res.status(401).json({ ok: false, error: 'Не авторизован' });
+  }
+  req.teacher = session;
+  next();
+}
+
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
+
+// Вход учителя: email + PIN → токен сессии
+app.post('/auth/login', (req, res) => {
+  const { email, pin } = req.body || {};
+  if (!email || !pin) {
+    return res.status(400).json({ ok: false, error: 'Укажите email и PIN' });
+  }
+  const teacher = findTeacher(email, pin);
+  if (!teacher) {
+    return res.status(401).json({ ok: false, error: 'Неверный email или PIN' });
+  }
+  const token = createSession(teacher);
+  res.json({
+    ok: true,
+    token,
+    teacher: { email: teacher.email, name: teacher.name, managerId: teacher.managerId },
+  });
+});
+
+// Проверка текущей сессии (для автологина при открытии страницы)
+app.get('/auth/me', requireAuth, (req, res) => {
+  res.json({ ok: true, teacher: req.teacher });
+});
+
+// Выход
+app.post('/auth/logout', requireAuth, (req, res) => {
+  const token = req.headers['x-session-token'];
+  sessions.delete(token);
+  res.json({ ok: true });
+});
+
+// Группы конкретного учителя (только те где он назначен ведущим)
+app.get('/teacher/classes', requireAuth, async (req, res) => {
+  try {
+    const classesRes = await mk('/classes', {
+      managerId: req.teacher.managerId,
+      limit: 100,
+    });
+    const classes = (classesRes.classes || []).map(c => ({
+      classId:  c.id,
+      name:     c.name,
+      courseId: c.courseId,
+      level:    COURSE_LEVELS[c.courseId] || c.name,
+      filialId: c.filialId,
+    }));
+    res.json({ ok: true, data: classes });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+      detail: e.response?.data || null,
+    });
+  }
+});
+
+// ─── ADMIN: управление учителями ────────────────────────────────────────────
+
+// Список сотрудников из МойКласс (чтобы админ выбрал manager_id, не вводя вслепую)
+app.get('/admin/managers', async (req, res) => {
+  try {
+    const data = await mk('/managers', { limit: 100 });
+    const managers = (data.managers || []).map(m => ({
+      managerId: m.id,
+      name: `${m.lastName || ''} ${m.firstName || ''}`.trim() || m.name || `#${m.id}`,
+      email: m.email || null,
+      phone: m.phone || null,
+    }));
+    res.json({ ok: true, data: managers });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
+  }
+});
+
+// Список всех учителей (без PIN в ответе)
+app.get('/admin/teachers', (req, res) => {
+  res.json({
+    ok: true,
+    data: TEACHERS.map(t => ({ email: t.email, name: t.name, managerId: t.managerId })),
+  });
+});
+
+// Добавить / обновить учителя
+app.post('/admin/teachers', (req, res) => {
+  const { email, name, managerId, pin } = req.body || {};
+  if (!email || !managerId || !pin) {
+    return res.status(400).json({ ok: false, error: 'Нужны email, managerId, pin' });
+  }
+  const idx = TEACHERS.findIndex(t => t.email.toLowerCase() === email.toLowerCase());
+  const record = { email, name: name || email, managerId: Number(managerId), pin: String(pin) };
+  if (idx >= 0) TEACHERS[idx] = record;
+  else TEACHERS.push(record);
+  res.json({ ok: true, data: { email, name: record.name, managerId: record.managerId } });
+});
+
+// Удалить учителя
+app.delete('/admin/teachers/:email', (req, res) => {
+  TEACHERS = TEACHERS.filter(t => t.email.toLowerCase() !== req.params.email.toLowerCase());
+  res.json({ ok: true });
+});
 
 // Портфолио по ID ученика (для родителей — без авторизации, по UUID-ссылке)
 app.get('/p/:token', async (req, res) => {
