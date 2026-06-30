@@ -8,6 +8,8 @@ const express = require('express');
 const cors    = require('cors');
 const axios   = require('axios');
 const crypto  = require('crypto');
+const fs      = require('fs');
+const path    = require('path');
 
 const app = express();
 app.use(cors());
@@ -227,13 +229,33 @@ async function buildPortfolio(userId) {
   });
 }
 
-// ─── TEACHER AUTH (in-memory store — заменить на БД в продакшене) ──────────
+// ─── ПЕРСИСТЕНТНОЕ ХРАНИЛИЩЕ ──────────────────────────────────────────────
+// Учителя и сессии сохраняются в JSON-файл на диске, чтобы НЕ стираться
+// при каждом передеплое. Railway: подключи Volume с mount path = DATA_DIR
+// (по умолчанию /data). Если volume не подключён — данные хранятся в /tmp
+// (тоже переживают рестарт процесса, но НЕ переживают пересоздание контейнера
+// при некоторых типах деплоя — поэтому Volume настоятельно рекомендуется).
+const DATA_DIR  = process.env.DATA_DIR || '/data';
+const DATA_FILE = path.join(fs.existsSync(DATA_DIR) ? DATA_DIR : '/tmp', 'teachers.json');
+
+function loadTeachers() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    }
+  } catch (e) { console.error('Не удалось прочитать teachers.json:', e.message); }
+  return [];
+}
+
+function saveTeachers(teachers) {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(teachers, null, 2));
+  } catch (e) { console.error('Не удалось сохранить teachers.json:', e.message); }
+}
+
 // Админ добавляет учителей здесь: email из МойКласс + managerId + свой PIN.
 // PIN — простой пароль который задаёт администратор, не связан с МойКласс паролем.
-let TEACHERS = [
-  // Пример — заполнить реальными данными через /admin/teachers
-  // { email: "nurgul@beschool.kg", managerId: 12345, pin: "1234", name: "Нургуль Асанова" },
-];
+let TEACHERS = loadTeachers();
 
 function findTeacher(email, pin) {
   const norm = (s) => (s || '').trim().toLowerCase();
@@ -242,7 +264,7 @@ function findTeacher(email, pin) {
   );
 }
 
-// Простые токены сессии (in-memory). В продакшене — JWT с секретом.
+// Простые токены сессии (in-memory — это ОК, при разлогине просто войти заново)
 const sessions = new Map(); // sessionToken → { email, managerId, name, createdAt }
 
 function createSession(teacher) {
@@ -351,10 +373,35 @@ app.get('/teacher/classes', requireAuth, async (req, res) => {
   }
 });
 
+// ─── ADMIN: пароль-защита (только ты) ───────────────────────────────────────
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
+const adminSessions = new Set(); // простые токены админ-сессии (in-memory)
+
+app.post('/admin/login', (req, res) => {
+  const { password } = req.body || {};
+  if (!ADMIN_PASSWORD) {
+    return res.status(500).json({ ok: false, error: 'ADMIN_PASSWORD не настроен на сервере' });
+  }
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ ok: false, error: 'Неверный пароль' });
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  adminSessions.add(token);
+  res.json({ ok: true, token });
+});
+
+function requireAdmin(req, res, next) {
+  const token = req.headers['x-admin-token'];
+  if (!token || !adminSessions.has(token)) {
+    return res.status(401).json({ ok: false, error: 'Нужен доступ администратора' });
+  }
+  next();
+}
+
 // ─── ADMIN: управление учителями ────────────────────────────────────────────
 
 // Список сотрудников из МойКласс (чтобы админ выбрал manager_id, не вводя вслепую)
-app.get('/admin/managers', async (req, res) => {
+app.get('/admin/managers', requireAdmin, async (req, res) => {
   try {
     const raw = await mk('/managers', { limit: 100 });
     const managers = (raw.managers || raw.data || (Array.isArray(raw) ? raw : []) || []).map(m => ({
@@ -370,7 +417,7 @@ app.get('/admin/managers', async (req, res) => {
 });
 
 // Список всех учителей (без PIN в ответе)
-app.get('/admin/teachers', (req, res) => {
+app.get('/admin/teachers', requireAdmin, (req, res) => {
   res.json({
     ok: true,
     data: TEACHERS.map(t => ({ email: t.email, name: t.name, managerId: t.managerId })),
@@ -378,7 +425,7 @@ app.get('/admin/teachers', (req, res) => {
 });
 
 // Добавить / обновить учителя
-app.post('/admin/teachers', (req, res) => {
+app.post('/admin/teachers', requireAdmin, (req, res) => {
   const { email, name, managerId, pin } = req.body || {};
   if (!email || !managerId || !pin) {
     return res.status(400).json({ ok: false, error: 'Нужны email, managerId, pin' });
@@ -387,12 +434,14 @@ app.post('/admin/teachers', (req, res) => {
   const record = { email, name: name || email, managerId: Number(managerId), pin: String(pin) };
   if (idx >= 0) TEACHERS[idx] = record;
   else TEACHERS.push(record);
+  saveTeachers(TEACHERS);
   res.json({ ok: true, data: { email, name: record.name, managerId: record.managerId } });
 });
 
 // Удалить учителя
-app.delete('/admin/teachers/:email', (req, res) => {
+app.delete('/admin/teachers/:email', requireAdmin, (req, res) => {
   TEACHERS = TEACHERS.filter(t => t.email.toLowerCase() !== req.params.email.toLowerCase());
+  saveTeachers(TEACHERS);
   res.json({ ok: true });
 });
 
@@ -428,13 +477,14 @@ app.get('/class/:classId/students', async (req, res) => {
     const recordsRes = await mk('/lessonRecords', { classId, limit: 500 });
     const records = Array.isArray(recordsRes) ? recordsRes : (recordsRes.lessonRecords || []);
 
-    // Группируем по ученику: всего записей / посещено
+    // Группируем по ученику: всего записей / посещено / оценки
     const attendanceByUser = {};
     for (const r of records) {
       const uid = r.userId;
-      if (!attendanceByUser[uid]) attendanceByUser[uid] = { total: 0, visited: 0 };
+      if (!attendanceByUser[uid]) attendanceByUser[uid] = { total: 0, visited: 0, marks: [] };
       attendanceByUser[uid].total += 1;
       if (r.visit) attendanceByUser[uid].visited += 1;
+      if (r.lessonMark != null && r.lessonMark > 0) attendanceByUser[uid].marks.push(r.lessonMark);
     }
 
     // 3. Имена учеников — МойКласс не отдаёт ФИО в /joins, нужен отдельный запрос
@@ -451,13 +501,17 @@ app.get('/class/:classId/students', async (req, res) => {
     );
 
     const students = joins.map((j, i) => {
-      const att = attendanceByUser[j.userId] || { total: 0, visited: 0 };
+      const att = attendanceByUser[j.userId] || { total: 0, visited: 0, marks: [] };
+      const avgMark = att.marks.length
+        ? Math.round(att.marks.reduce((a, b) => a + b, 0) / att.marks.length)
+        : null;
       return {
         userId:       j.userId,
         name:         names[i],
         visits:       att.visited,
         totalLessons: att.total,
         attendance:   att.total > 0 ? Math.round((att.visited / att.total) * 100) : null,
+        avgMark,
         lastVisit:    j.stats?.lastVisit || null,
         portfolioUrl: `/p/${j.userId}`,
       };
@@ -470,18 +524,18 @@ app.get('/class/:classId/students', async (req, res) => {
 });
 
 // Редактор словаря навыков (для админа)
-app.get('/admin/skills-dict', (req, res) => {
+app.get('/admin/skills-dict', requireAdmin, (req, res) => {
   res.json({ ok: true, data: SKILL_DICT });
 });
 
-app.put('/admin/skills-dict', (req, res) => {
+app.put('/admin/skills-dict', requireAdmin, (req, res) => {
   SKILL_DICT = req.body;
   cache.clear(); // Сбросить кэш при изменении словаря
   res.json({ ok: true });
 });
 
 // Принудительная синхронизация
-app.post('/admin/sync/:userId', async (req, res) => {
+app.post('/admin/sync/:userId', requireAdmin, async (req, res) => {
   cache.delete(`portfolio:${req.params.userId}`);
   try {
     const portfolio = await buildPortfolio(parseInt(req.params.userId));
