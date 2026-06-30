@@ -124,7 +124,7 @@ async function buildPortfolio(userId) {
   return cached(`portfolio:${userId}`, async () => {
 
     // 1. Записи ученика в группах
-    const joinsRes = await mk('/joins', { user_id: userId, limit: 50 });
+    const joinsRes = await mk('/joins', { userId: userId, limit: 50 });
     const joins    = joinsRes.joins || [];
 
     // Найти активную группу (по дате последнего реального посещения)
@@ -139,7 +139,7 @@ async function buildPortfolio(userId) {
     const totalPaid = joins.reduce((s, j) => s + (j.stats?.totalPayed || 0), 0);
 
     // 2. Оценки и посещаемость — только по активной группе
-    const recordsRes = await mk('/lessonRecords', { user_id: userId, class_id: classId, limit: 200 });
+    const recordsRes = await mk('/lessonRecords', { userId: userId, classId: classId, limit: 200 });
     const records    = recordsRes.lessonRecords || [];
 
     const visited = records.filter(r => r.visit);
@@ -154,9 +154,9 @@ async function buildPortfolio(userId) {
 
     // 3. Уроки с темами для skill-баров
     const lessonsRes = await mk('/lessons', {
-      class_id: classId,
+      classId: classId,
       limit: 100,
-      date_from: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
+      dateFrom: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
         .toISOString().split('T')[0],
     });
     const lessons = lessonsRes.lessons || [];
@@ -251,7 +251,7 @@ app.get('/p/:token', async (req, res) => {
 app.get('/class/:classId/students', async (req, res) => {
   try {
     const joinsRes = await mk('/joins', {
-      class_id: req.params.classId,
+      classId: req.params.classId,
       limit: 100,
     });
     const students = (joinsRes.joins || []).map(j => ({
