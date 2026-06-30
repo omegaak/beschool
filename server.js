@@ -310,21 +310,18 @@ app.get('/teacher/classes', requireAuth, async (req, res) => {
   try {
     const managerId = req.teacher.managerId;
 
-    // Пытаемся через серверный фильтр API...
-    const filteredRes = await mk('/classes', { managerId, limit: 100 });
-    let rawClasses = filteredRes.classes || [];
+    // GET /classes возвращает ГОЛЫЙ массив в корне ответа (не {classes:[...]})
+    const allRes = await mk('/classes', { limit: 500 });
+    const allClasses = Array.isArray(allRes) ? allRes : (allRes.classes || []);
 
-    // ...но дополнительно подстраховываемся: если API фильтр не сработал
-    // (вернул 0 или вернул вообще все группы компании), проверяем поле
-    // teacherIds вручную — именно там МойКласс хранит ведущих преподавателей.
-    const allRes = await mk('/classes', { limit: 200 });
-    const allClasses = allRes.classes || [];
-    const byTeacherIds = allClasses.filter(c =>
-      Array.isArray(c.teacherIds) && c.teacherIds.includes(managerId)
+    // Группа ведётся этим учителем, если его managerId есть в поле managerIds
+    const myClasses = allClasses.filter(c =>
+      Array.isArray(c.managerIds) && c.managerIds.includes(managerId)
     );
 
-    // Берём то множество, которое реально содержит этого учителя
-    const finalClasses = byTeacherIds.length > 0 ? byTeacherIds : rawClasses;
+    // Берём только реально активные группы (не архивные)
+    const activeClasses = myClasses.filter(c => c.status === 'opened');
+    const finalClasses = activeClasses.length > 0 ? activeClasses : myClasses;
 
     const classes = finalClasses.map(c => ({
       classId:  c.id,
@@ -332,6 +329,7 @@ app.get('/teacher/classes', requireAuth, async (req, res) => {
       courseId: c.courseId,
       level:    COURSE_LEVELS[c.courseId] || c.name,
       filialId: c.filialId,
+      status:   c.status,
     }));
 
     res.json({
@@ -339,10 +337,9 @@ app.get('/teacher/classes', requireAuth, async (req, res) => {
       data: classes,
       _debug: {
         managerId,
-        filteredCount: rawClasses.length,
         totalClassesChecked: allClasses.length,
-        byTeacherIdsCount: byTeacherIds.length,
-        _rawSample: allClasses.length === 0 ? allRes : allClasses.slice(0, 2),
+        myClassesCount: myClasses.length,
+        activeClassesCount: activeClasses.length,
       },
     });
   } catch (e) {
