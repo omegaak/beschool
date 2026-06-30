@@ -417,20 +417,55 @@ app.get('/p/:token', async (req, res) => {
 // Список учеников группы (для учителя)
 app.get('/class/:classId/students', async (req, res) => {
   try {
-    const joinsRes = await mk('/joins', {
-      classId: req.params.classId,
-      limit: 100,
+    const classId = req.params.classId;
+
+    // 1. Записи учеников в группе (МойКласс возвращает голый массив в корне)
+    const joinsRes = await mk('/joins', { classId, limit: 100 });
+    const joins = Array.isArray(joinsRes) ? joinsRes : (joinsRes.joins || []);
+
+    // 2. Все отметки посещаемости по этой группе — считаем реальный % сами,
+    // а не доверяем agregированной статистике МойКласс (она может быть неточной)
+    const recordsRes = await mk('/lessonRecords', { classId, limit: 1000 });
+    const records = Array.isArray(recordsRes) ? recordsRes : (recordsRes.lessonRecords || []);
+
+    // Группируем по ученику: всего записей / посещено
+    const attendanceByUser = {};
+    for (const r of records) {
+      const uid = r.userId;
+      if (!attendanceByUser[uid]) attendanceByUser[uid] = { total: 0, visited: 0 };
+      attendanceByUser[uid].total += 1;
+      if (r.visit) attendanceByUser[uid].visited += 1;
+    }
+
+    // 3. Имена учеников — МойКласс не отдаёт ФИО в /joins, нужен отдельный запрос
+    const names = await Promise.all(
+      joins.map(j =>
+        mk(`/users/${j.userId}`)
+          .then(u => {
+            const user = Array.isArray(u) ? u[0] : u;
+            const full = `${user?.name || ''} ${user?.surname || ''}`.trim();
+            return full || `Ученик #${j.userId}`;
+          })
+          .catch(() => `Ученик #${j.userId}`)
+      )
+    );
+
+    const students = joins.map((j, i) => {
+      const att = attendanceByUser[j.userId] || { total: 0, visited: 0 };
+      return {
+        userId:       j.userId,
+        name:         names[i],
+        visits:       att.visited,
+        totalLessons: att.total,
+        attendance:   att.total > 0 ? Math.round((att.visited / att.total) * 100) : null,
+        lastVisit:    j.stats?.lastVisit || null,
+        portfolioUrl: `/p/${j.userId}`,
+      };
     });
-    const students = (joinsRes.joins || []).map(j => ({
-      userId:      j.userId,
-      visits:      j.stats?.visits || 0,
-      lastVisit:   j.stats?.lastVisit,
-      totalPayed:  j.stats?.totalPayed || 0,
-      portfolioUrl:`/p/${j.userId}`,
-    }));
+
     res.json({ ok: true, data: students });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
   }
 });
 
