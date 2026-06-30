@@ -308,18 +308,42 @@ app.post('/auth/logout', requireAuth, (req, res) => {
 // Группы конкретного учителя (только те где он назначен ведущим)
 app.get('/teacher/classes', requireAuth, async (req, res) => {
   try {
-    const classesRes = await mk('/classes', {
-      managerId: req.teacher.managerId,
-      limit: 100,
-    });
-    const classes = (classesRes.classes || []).map(c => ({
+    const managerId = req.teacher.managerId;
+
+    // Пытаемся через серверный фильтр API...
+    const filteredRes = await mk('/classes', { managerId, limit: 100 });
+    let rawClasses = filteredRes.classes || [];
+
+    // ...но дополнительно подстраховываемся: если API фильтр не сработал
+    // (вернул 0 или вернул вообще все группы компании), проверяем поле
+    // teacherIds вручную — именно там МойКласс хранит ведущих преподавателей.
+    const allRes = await mk('/classes', { limit: 200 });
+    const allClasses = allRes.classes || [];
+    const byTeacherIds = allClasses.filter(c =>
+      Array.isArray(c.teacherIds) && c.teacherIds.includes(managerId)
+    );
+
+    // Берём то множество, которое реально содержит этого учителя
+    const finalClasses = byTeacherIds.length > 0 ? byTeacherIds : rawClasses;
+
+    const classes = finalClasses.map(c => ({
       classId:  c.id,
       name:     c.name,
       courseId: c.courseId,
       level:    COURSE_LEVELS[c.courseId] || c.name,
       filialId: c.filialId,
     }));
-    res.json({ ok: true, data: classes });
+
+    res.json({
+      ok: true,
+      data: classes,
+      _debug: {
+        managerId,
+        filteredCount: rawClasses.length,
+        totalClassesChecked: allClasses.length,
+        byTeacherIdsCount: byTeacherIds.length,
+      },
+    });
   } catch (e) {
     res.status(500).json({
       ok: false,
