@@ -26,12 +26,11 @@
  * "признак скидки" заводить не нужно — он уже в CRM, просто назначается
  * администратором на абонементе как обычно.
  *
- * ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ MVP: /mkassa/create-payment сейчас не проверяет,
- * что запрос пришёл от авторизованного родителя (в кабинете ещё нет parent-auth).
- * До запуска в бой — обязательно повесить сюда проверку сессии родителя,
- * иначе кто угодно сможет запросить статус чужого абонемента и сгенерировать
- * на него QR (сумма при этом всегда берётся живьём из МойКласс, подменить её
- * в запросе нельзя — но платить за чужого ребёнка технически можно будет).
+ * АВТОРИЗАЦИЯ: все роуты, привязанные к конкретному ученику (subscriptions,
+ * create-payment, status, cancel), проверяются через checkStudentAccess,
+ * который передаётся сюда из server.js — учитель видит любого своего
+ * ученика по своей сессии, родитель/ученик — только себя, по телефону+PIN
+ * (см. /parent/login в server.js). Без валидной сессии — 401.
  */
 
 const axios = require('axios');
@@ -191,15 +190,19 @@ function makeStore(dataDir) {
 }
 
 // ─── Роуты ───────────────────────────────────────────────────────────────────
-function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {} } = {}) {
+function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {}, checkStudentAccess = () => ({ ok: true }) } = {}) {
   const store = makeStore(DATA_DIR);
 
   // Активные абонементы ученика — фронтенд показывает их вместо того, чтобы
   // просить родителя вручную вводить сумму (стоимость зависит от уровня и
   // от индивидуальной скидки, которая уже назначается в самом МойКласс).
+  // Доступ: учитель — к любому своему ученику, родитель — только к своему.
   app.get('/mkassa/subscriptions/:userId', async (req, res) => {
     try {
       const userId = Number(req.params.userId);
+      if (!checkStudentAccess(req, userId).ok) {
+        return res.status(401).json({ ok: false, error: 'Не авторизован' });
+      }
       const subs = await getActiveUserSubscriptions(userId);
       // Не фильтруем «нечего платить» здесь — иначе уже оплаченный абонемент
       // выглядит так же, как «абонемент вообще не найден», и это невозможно
@@ -228,12 +231,16 @@ function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {} } = {}) {
   // Родитель нажал «Оплатить» в кабинете — создаём динамический QR.
   // Если передан userSubscriptionId — сумму берём ЖИВЬЁМ из МойКласс
   // (remindSumm/price с учётом скидки), а не из того, что прислал фронтенд —
-  // чтобы никто не мог подменить сумму в запросе.
+  // чтобы никто не мог подменить сумму в запросе. Доступ проверяем так же —
+  // родитель может оплачивать только своего ребёнка (userId из его сессии).
   app.post('/mkassa/create-payment', async (req, res) => {
     try {
       const { userId, amountSom, userSubscriptionId, filialId, comment } = req.body || {};
       if (!userId) {
         return res.status(400).json({ ok: false, error: 'Нужен userId' });
+      }
+      if (!checkStudentAccess(req, userId).ok) {
+        return res.status(401).json({ ok: false, error: 'Не авторизован' });
       }
 
       let finalAmountSom;
@@ -298,6 +305,9 @@ function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {} } = {}) {
   app.get('/mkassa/status/:id', async (req, res) => {
     const record = store.get(req.params.id);
     if (!record) return res.status(404).json({ ok: false, error: 'Транзакция не найдена' });
+    if (!checkStudentAccess(req, record.userId).ok) {
+      return res.status(401).json({ ok: false, error: 'Не авторизован' });
+    }
     res.json({ ok: true, data: { status: record.status, paidAt: record.paidAt } });
   });
 
@@ -306,6 +316,9 @@ function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {} } = {}) {
     try {
       const record = store.get(req.params.id);
       if (!record) return res.status(404).json({ ok: false, error: 'Транзакция не найдена' });
+      if (!checkStudentAccess(req, record.userId).ok) {
+        return res.status(401).json({ ok: false, error: 'Не авторизован' });
+      }
       if (record.status === 'pending') {
         await cancelTransaction(req.params.id).catch(() => {});
         store.set(req.params.id, { ...record, status: 'canceled' });

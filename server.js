@@ -296,6 +296,109 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// ─── ПЕРСИСТЕНТНОЕ ХРАНИЛИЩЕ: доступ учеников ────────────────────────────────
+// Логин ученика — это его собственный userId в МойКласс (тот же ID, что и в
+// ссылке на портфолио /p/:userId, выдаётся при первичной регистрации в
+// МойКласс). Пароль по умолчанию для всех — DEFAULT_STUDENT_PASSWORD. Пока
+// ученик его не сменил, отдельной записи в students.json для него нет — он
+// существует "виртуально" и входит дефолтным паролем. Как только пароль
+// сменён, создаётся запись с хэшем нового пароля, и вход возможен только по
+// нему. Сброс (кнопка админа) — просто удаляет запись, всё возвращается в
+// состояние "по умолчанию" (пароль снова 12345678).
+const STUDENTS_FILE = path.join(fs.existsSync(DATA_DIR) ? DATA_DIR : '/tmp', 'students.json');
+const DEFAULT_STUDENT_PASSWORD = '12345678';
+
+function loadStudents() {
+  try {
+    if (fs.existsSync(STUDENTS_FILE)) {
+      return JSON.parse(fs.readFileSync(STUDENTS_FILE, 'utf8'));
+    }
+  } catch (e) { console.error('Не удалось прочитать students.json:', e.message); }
+  return [];
+}
+
+function saveStudents(students) {
+  try {
+    fs.writeFileSync(STUDENTS_FILE, JSON.stringify(students, null, 2));
+  } catch (e) { console.error('Не удалось сохранить students.json:', e.message); }
+}
+
+// STUDENTS хранит записи ТОЛЬКО для тех, кто сменил пароль: { userId, salt, hash, updatedAt }
+let STUDENTS = loadStudents();
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return { salt, hash };
+}
+
+function verifyPassword(password, salt, hash) {
+  try {
+    const check = crypto.scryptSync(String(password), salt, 64).toString('hex');
+    return crypto.timingSafeEqual(Buffer.from(check, 'hex'), Buffer.from(hash, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+// { ok, mustChangePassword } — не палит существование userId в ответе
+function verifyStudentLogin(userId, password) {
+  const uid = Number(userId);
+  const record = STUDENTS.find(s => Number(s.userId) === uid);
+  if (record) {
+    return verifyPassword(password, record.salt, record.hash)
+      ? { ok: true, mustChangePassword: false }
+      : { ok: false };
+  }
+  return password === DEFAULT_STUDENT_PASSWORD
+    ? { ok: true, mustChangePassword: true }
+    : { ok: false };
+}
+
+const parentSessions = new Map(); // sessionToken → { userId, createdAt }
+
+function createParentSession(userId) {
+  const token = crypto.randomBytes(24).toString('hex');
+  parentSessions.set(token, { userId: Number(userId), createdAt: Date.now() });
+  return token;
+}
+
+function getParentSession(token) {
+  const s = parentSessions.get(token);
+  if (!s) return null;
+  if (Date.now() - s.createdAt > 30 * 24 * 60 * 60 * 1000) {
+    parentSessions.delete(token);
+    return null;
+  }
+  return s;
+}
+
+// Middleware: проверка авторизации ученика/родителя
+function requireParentAuth(req, res, next) {
+  const token = req.headers['x-parent-token'];
+  const session = token ? getParentSession(token) : null;
+  if (!session) {
+    return res.status(401).json({ ok: false, error: 'Не авторизован' });
+  }
+  req.parent = session;
+  next();
+}
+
+// Единая точка проверки доступа к данным конкретного ученика: учитель (по
+// своей сессии) видит любого своего ученика, ученик/родитель — только себя
+// (userId сверяется с userId его собственной сессии). Передаётся в mkassa.js,
+// чтобы платёжные роуты использовали ту же логику.
+function checkStudentAccess(req, targetUserId) {
+  const teacherToken = req.headers['x-session-token'];
+  if (teacherToken && getSession(teacherToken)) return { ok: true, via: 'teacher' };
+
+  const parentToken = req.headers['x-parent-token'];
+  if (parentToken) {
+    const ps = getParentSession(parentToken);
+    if (ps && Number(ps.userId) === Number(targetUserId)) return { ok: true, via: 'parent' };
+  }
+  return { ok: false };
+}
+
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 // Вход учителя: email + PIN → токен сессии
@@ -325,6 +428,50 @@ app.get('/auth/me', requireAuth, (req, res) => {
 app.post('/auth/logout', requireAuth, (req, res) => {
   const token = req.headers['x-session-token'];
   sessions.delete(token);
+  res.json({ ok: true });
+});
+
+// Вход ученика: ID (тот же, что и в ссылке на портфолио) + пароль (по
+// умолчанию DEFAULT_STUDENT_PASSWORD, пока не сменён). mustChangePassword
+// заставляет фронтенд показать экран смены пароля прежде, чем открыть
+// портфолио.
+app.post('/parent/login', (req, res) => {
+  const { userId, password } = req.body || {};
+  if (!userId || !password) {
+    return res.status(400).json({ ok: false, error: 'Укажите ID ученика и пароль' });
+  }
+  const result = verifyStudentLogin(userId, password);
+  if (!result.ok) {
+    return res.status(401).json({ ok: false, error: 'Неверный ID или пароль' });
+  }
+  const token = createParentSession(userId);
+  res.json({ ok: true, token, userId: Number(userId), mustChangePassword: result.mustChangePassword });
+});
+
+// Проверка сохранённой сессии (для автологина при открытии страницы)
+app.get('/parent/me', requireParentAuth, (req, res) => {
+  const record = STUDENTS.find(s => Number(s.userId) === Number(req.parent.userId));
+  res.json({ ok: true, userId: req.parent.userId, mustChangePassword: !record });
+});
+
+app.post('/parent/logout', requireParentAuth, (req, res) => {
+  const token = req.headers['x-parent-token'];
+  parentSessions.delete(token);
+  res.json({ ok: true });
+});
+
+// Смена пароля — обязательна при первом входе (mustChangePassword=true),
+// доступна и в любой момент позже. Ровно 8 символов, как просил заказчик.
+app.post('/parent/change-password', requireParentAuth, (req, res) => {
+  const { newPassword } = req.body || {};
+  if (!newPassword || String(newPassword).length !== 8) {
+    return res.status(400).json({ ok: false, error: 'Новый пароль должен содержать ровно 8 символов' });
+  }
+  const uid = Number(req.parent.userId);
+  const { salt, hash } = hashPassword(newPassword);
+  STUDENTS = STUDENTS.filter(s => Number(s.userId) !== uid);
+  STUDENTS.push({ userId: uid, salt, hash, updatedAt: new Date().toISOString() });
+  saveStudents(STUDENTS);
   res.json({ ok: true });
 });
 
@@ -446,12 +593,35 @@ app.delete('/admin/teachers/:email', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// Портфолио по ID ученика (для родителей — без авторизации, по UUID-ссылке)
+// ─── ADMIN: доступ учеников ──────────────────────────────────────────────────
+
+// Список ID учеников, сменивших пароль (у остальных действует пароль по
+// умолчанию 12345678 — отдельной записи для них нет, показывать нечего)
+app.get('/admin/students', requireAdmin, (req, res) => {
+  res.json({
+    ok: true,
+    data: STUDENTS.map(s => ({ userId: s.userId, updatedAt: s.updatedAt })),
+  });
+});
+
+// Сбросить пароль ученика на значение по умолчанию (12345678), например если
+// он его забыл. Работает для любого userId, даже если записи ещё не было.
+app.post('/admin/students/:userId/reset-password', requireAdmin, (req, res) => {
+  const uid = Number(req.params.userId);
+  STUDENTS = STUDENTS.filter(s => Number(s.userId) !== uid);
+  saveStudents(STUDENTS);
+  res.json({ ok: true, message: `Пароль ученика #${uid} сброшен на значение по умолчанию` });
+});
+
+// Портфолио по ID ученика — теперь требует авторизации: учитель (своя сессия)
+// видит любого своего ученика, родитель — только своего ребёнка.
 app.get('/p/:token', async (req, res) => {
   try {
-    // В продакшене token → userId через таблицу tokens в БД
-    // Здесь упрощённо: token = userId (заменить на UUID в продакшене)
-    const userId   = parseInt(req.params.token);
+    const userId = parseInt(req.params.token);
+    const access = checkStudentAccess(req, userId);
+    if (!access.ok) {
+      return res.status(401).json({ ok: false, error: 'Не авторизован' });
+    }
     const portfolio = await buildPortfolio(userId);
     res.json({ ok: true, data: portfolio });
   } catch (e) {
@@ -590,7 +760,7 @@ app.get('/health', async (req, res) => {
 const MKASSA_ENABLED = process.env.MKASSA_ENABLED !== 'false';
 
 if (MKASSA_ENABLED) {
-  registerMkassaRoutes(app, { DATA_DIR, courseLevels: COURSE_LEVELS });
+  registerMkassaRoutes(app, { DATA_DIR, courseLevels: COURSE_LEVELS, checkStudentAccess });
   console.log('MKassa: модуль оплаты включён');
 } else {
   console.log('MKassa: модуль оплаты отключён (MKASSA_ENABLED=false)');
