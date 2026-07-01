@@ -548,7 +548,7 @@ app.post('/admin/sync/:userId', requireAdmin, async (req, res) => {
 
 // Healthcheck — также проверяет что МойКласс ключ валиден
 app.get('/health', async (req, res) => {
-  const base = { ok: true, version: '1.0', timestamp: new Date() };
+  const base = { ok: true, version: '1.0', timestamp: new Date(), mkassaEnabled: process.env.MKASSA_ENABLED !== 'false' };
   try {
     await getMkToken();
     res.json({ ...base, moyklass: 'connected' });
@@ -561,9 +561,21 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// MKassa QR-платежи — отдельный МойКласс-ключ (MOYKLASS_PAYMENTS_API_KEY),
-// см. mkassa.js и mkassa-integration-plan.md
-registerMkassaRoutes(app, { DATA_DIR });
+// MKassa QR-платежи — отдельный, самодостаточный модуль (mkassa.js), подключаемый
+// одной строкой. Отключается без изменения кода: MKASSA_ENABLED=false в Railway.
+// Ничего в остальном backend'е не завязано на этот модуль — можно снести
+// require и вызов ниже, и всё остальное продолжит работать как раньше.
+const MKASSA_ENABLED = process.env.MKASSA_ENABLED !== 'false';
+
+if (MKASSA_ENABLED) {
+  registerMkassaRoutes(app, { DATA_DIR });
+  console.log('MKassa: модуль оплаты включён');
+} else {
+  console.log('MKassa: модуль оплаты отключён (MKASSA_ENABLED=false)');
+  app.all('/mkassa/*', (req, res) => {
+    res.status(503).json({ ok: false, error: 'Оплата временно недоступна' });
+  });
+}
 
 app.listen(PORT, () =>
   console.log(`BE School Portfolio Backend running on :${PORT}`));
