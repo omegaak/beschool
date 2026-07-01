@@ -113,9 +113,12 @@ async function cancelTransaction(id) {
 // назначается администратором в самом МойКласс как обычно.
 async function getActiveUserSubscriptions(userId) {
   const token = await getPaymentsToken();
+  // ВАЖНО: параметр называется именно statusId (не userSubscriptionStatus —
+  // это была ошибка в первой версии, из-за неё МойКласс не фильтровал по
+  // статусу как ожидалось). 2 = Активный.
   const { data } = await axios.get(MK_USERSUBS_URL, {
     headers: { 'x-access-token': token },
-    params: { userId, userSubscriptionStatus: 2 }, // 2 = Активный
+    params: { userId, statusId: 2 },
   });
   return data.subscriptions || [];
 }
@@ -193,23 +196,25 @@ function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {} } = {}) {
     try {
       const userId = Number(req.params.userId);
       const subs = await getActiveUserSubscriptions(userId);
-      const data = subs
-        .map(s => ({
-          userSubscriptionId: s.id,
-          courseId: (s.courseIds || [])[0] || null,
-          level: courseLevels[(s.courseIds || [])[0]] || null,
-          originalPrice: s.originalPrice,
-          discountPct: s.discount || 0,
-          extraDiscount: s.extraDiscount || 0,
-          price: s.price,
-          payed: s.payed,
-          due: dueFromSubscription(s),
-          period: s.period,
-          beginDate: s.beginDate,
-          endDate: s.endDate,
-        }))
-        .filter(s => s.due > 0); // нечего платить — не показываем
-      res.json({ ok: true, data });
+      // Не фильтруем «нечего платить» здесь — иначе уже оплаченный абонемент
+      // выглядит так же, как «абонемент вообще не найден», и это невозможно
+      // отличить снаружи. Решение, что показывать, оставляем фронтенду.
+      const data = subs.map(s => ({
+        userSubscriptionId: s.id,
+        courseId: (s.courseIds || [])[0] || null,
+        level: courseLevels[(s.courseIds || [])[0]] || null,
+        originalPrice: s.originalPrice,
+        discountPct: s.discount || 0,
+        extraDiscount: s.extraDiscount || 0,
+        price: s.price,
+        payed: s.payed,
+        due: dueFromSubscription(s),
+        period: s.period,
+        beginDate: s.beginDate,
+        endDate: s.endDate,
+        statusId: s.statusId,
+      }));
+      res.json({ ok: true, data, _debug: { userId, statusFilter: 2, totalFound: subs.length } });
     } catch (e) {
       res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
     }
