@@ -524,6 +524,28 @@ app.get('/class/:classId/students', async (req, res) => {
   }
 });
 
+// Справочники МойКласс для настройки MKassa (одноразовый lookup для админа —
+// чтобы найти id типа оплаты "Безнал" и, при желании, id кассы под MKassa,
+// и прописать их в переменные окружения MOYKLASS_PAYMENT_TYPE_ID /
+// MOYKLASS_CASHBOX_ID на Railway, без использования MCP-коннектора).
+app.get('/admin/moyklass/payment-types', requireAdmin, async (req, res) => {
+  try {
+    const raw = await mk('/paymentTypes');
+    res.json({ ok: true, data: raw });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
+  }
+});
+
+app.get('/admin/moyklass/cashboxes', requireAdmin, async (req, res) => {
+  try {
+    const raw = await mk('/cashboxes');
+    res.json({ ok: true, data: raw });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
+  }
+});
+
 // Редактор словаря навыков (для админа)
 app.get('/admin/skills-dict', requireAdmin, (req, res) => {
   res.json({ ok: true, data: SKILL_DICT });
@@ -568,7 +590,7 @@ app.get('/health', async (req, res) => {
 const MKASSA_ENABLED = process.env.MKASSA_ENABLED !== 'false';
 
 if (MKASSA_ENABLED) {
-  registerMkassaRoutes(app, { DATA_DIR });
+  registerMkassaRoutes(app, { DATA_DIR, courseLevels: COURSE_LEVELS });
   console.log('MKassa: модуль оплаты включён');
 } else {
   console.log('MKassa: модуль оплаты отключён (MKASSA_ENABLED=false)');

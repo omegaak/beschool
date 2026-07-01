@@ -17,10 +17,19 @@
  *   MOYKLASS_CASHBOX_ID        — (опционально) id кассы в МойКласс для платежей MKassa
  *   MKASSA_DEFAULT_FILIAL_ID   — (опционально) filialId по умолчанию, если не передан в запросе
  *
+ * Сумма платежа берётся не вручную, а из активного абонемента ученика
+ * (GET /v1/company/userSubscriptions) — там уже есть цена по уровню/курсу,
+ * индивидуальная скидка (discount, %) и доп. компенсация (extraDiscount),
+ * и МойКласс сам считает итоговую price и остаток долга remindSumm. Отдельный
+ * "признак скидки" заводить не нужно — он уже в CRM, просто назначается
+ * администратором на абонементе как обычно.
+ *
  * ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ MVP: /mkassa/create-payment сейчас не проверяет,
  * что запрос пришёл от авторизованного родителя (в кабинете ещё нет parent-auth).
  * До запуска в бой — обязательно повесить сюда проверку сессии родителя,
- * иначе кто угодно сможет генерировать QR на чужого userId.
+ * иначе кто угодно сможет запросить статус чужого абонемента и сгенерировать
+ * на него QR (сумма при этом всегда берётся живьём из МойКласс, подменить её
+ * в запросе нельзя — но платить за чужого ребёнка технически можно будет).
  */
 
 const axios = require('axios');
@@ -36,6 +45,7 @@ const DEFAULT_FILIAL_ID = process.env.MKASSA_DEFAULT_FILIAL_ID;
 
 const MK_AUTH_URL = 'https://api.moyklass.com/v1/company/auth/getToken';
 const MK_PAYMENTS_URL = 'https://api.moyklass.com/v1/company/payments';
+const MK_USERSUBS_URL = 'https://api.moyklass.com/v1/company/userSubscriptions';
 
 // ─── Отдельный токен МойКласс для платежей (Payments key) ──────────────────
 let paymentsToken = null;
@@ -96,6 +106,35 @@ async function cancelTransaction(id) {
   return data;
 }
 
+// ─── Абонементы ученика (Payments key) — чтобы не спрашивать сумму руками ───
+// МойКласс уже хранит per-абонемент скидку (discount, % и extraDiscount,
+// фикс. сумма) и сам считает итоговую price и остаток долга (remindSumm) —
+// отдельного «признака скидки» заводить не нужно, он уже есть в CRM и
+// назначается администратором в самом МойКласс как обычно.
+async function getActiveUserSubscriptions(userId) {
+  const token = await getPaymentsToken();
+  const { data } = await axios.get(MK_USERSUBS_URL, {
+    headers: { 'x-access-token': token },
+    params: { userId, userSubscriptionStatus: 2 }, // 2 = Активный
+  });
+  return data.subscriptions || [];
+}
+
+async function getUserSubscriptionById(userSubscriptionId) {
+  const token = await getPaymentsToken();
+  const { data } = await axios.get(`${MK_USERSUBS_URL}/${userSubscriptionId}`, {
+    headers: { 'x-access-token': token },
+  });
+  return data;
+}
+
+function dueFromSubscription(s) {
+  // remindSumm — уже посчитанный МойКласс остаток долга; если вдруг не пришёл,
+  // считаем сами: price (с учётом скидки/доп. компенсации) минус оплачено
+  if (s.remindSumm != null) return Number(s.remindSumm);
+  return Math.max(0, Number(s.price || 0) - Number(s.payed || 0));
+}
+
 // ─── Создание платежа в МойКласс (Payments key) ─────────────────────────────
 async function createMoyklassPayment({ userId, summa, userSubscriptionId, filialId, comment }) {
   const token = await getPaymentsToken();
@@ -144,17 +183,68 @@ function makeStore(dataDir) {
 }
 
 // ─── Роуты ───────────────────────────────────────────────────────────────────
-function registerMkassaRoutes(app, { DATA_DIR } = {}) {
+function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {} } = {}) {
   const store = makeStore(DATA_DIR);
 
-  // Родитель нажал «Оплатить» в кабинете — создаём динамический QR
+  // Активные абонементы ученика — фронтенд показывает их вместо того, чтобы
+  // просить родителя вручную вводить сумму (стоимость зависит от уровня и
+  // от индивидуальной скидки, которая уже назначается в самом МойКласс).
+  app.get('/mkassa/subscriptions/:userId', async (req, res) => {
+    try {
+      const userId = Number(req.params.userId);
+      const subs = await getActiveUserSubscriptions(userId);
+      const data = subs
+        .map(s => ({
+          userSubscriptionId: s.id,
+          courseId: (s.courseIds || [])[0] || null,
+          level: courseLevels[(s.courseIds || [])[0]] || null,
+          originalPrice: s.originalPrice,
+          discountPct: s.discount || 0,
+          extraDiscount: s.extraDiscount || 0,
+          price: s.price,
+          payed: s.payed,
+          due: dueFromSubscription(s),
+          period: s.period,
+          beginDate: s.beginDate,
+          endDate: s.endDate,
+        }))
+        .filter(s => s.due > 0); // нечего платить — не показываем
+      res.json({ ok: true, data });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
+    }
+  });
+
+  // Родитель нажал «Оплатить» в кабинете — создаём динамический QR.
+  // Если передан userSubscriptionId — сумму берём ЖИВЬЁМ из МойКласс
+  // (remindSumm/price с учётом скидки), а не из того, что прислал фронтенд —
+  // чтобы никто не мог подменить сумму в запросе.
   app.post('/mkassa/create-payment', async (req, res) => {
     try {
       const { userId, amountSom, userSubscriptionId, filialId, comment } = req.body || {};
-      if (!userId || !amountSom) {
-        return res.status(400).json({ ok: false, error: 'Нужны userId и amountSom' });
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: 'Нужен userId' });
       }
-      const amountTyin = Math.round(Number(amountSom) * 100);
+
+      let finalAmountSom;
+      if (userSubscriptionId) {
+        const sub = await getUserSubscriptionById(userSubscriptionId);
+        if (!sub || Number(sub.userId) !== Number(userId)) {
+          return res.status(400).json({ ok: false, error: 'Абонемент не найден для этого ученика' });
+        }
+        finalAmountSom = dueFromSubscription(sub);
+        if (!(finalAmountSom > 0)) {
+          return res.status(400).json({ ok: false, error: 'По этому абонементу нет долга к оплате' });
+        }
+      } else if (amountSom) {
+        // Ручной ввод суммы — оставлен как запасной вариант (например,
+        // если у ученика ещё нет абонемента в МойКласс)
+        finalAmountSom = Number(amountSom);
+      } else {
+        return res.status(400).json({ ok: false, error: 'Нужны userSubscriptionId или amountSom' });
+      }
+
+      const amountTyin = Math.round(finalAmountSom * 100);
 
       const metadata = {
         key1: String(userId),
@@ -171,7 +261,7 @@ function registerMkassaRoutes(app, { DATA_DIR } = {}) {
         userId: Number(userId),
         userSubscriptionId: userSubscriptionId ? Number(userSubscriptionId) : null,
         filialId: filialId ? Number(filialId) : null,
-        amountSom: Number(amountSom),
+        amountSom: finalAmountSom,
         amountTyin,
         comment: comment || null,
         status: 'pending',
@@ -185,7 +275,7 @@ function registerMkassaRoutes(app, { DATA_DIR } = {}) {
         data: {
           id: mkassaTx.id,
           paymentToken: mkassaTx.payment_token,
-          amountSom: Number(amountSom),
+          amountSom: finalAmountSom,
           status: mkassaTx.status,
         },
       });
