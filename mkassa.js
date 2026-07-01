@@ -13,8 +13,10 @@
  * Переменные окружения (задать на Railway):
  *   MKASSA_CASHIER_API_KEY     — cashier api-key из личного кабинета MKassa
  *   MOYKLASS_PAYMENTS_API_KEY  — отдельный company-level ключ МойКласс, только для платежей
- *   MOYKLASS_PAYMENT_TYPE_ID   — id типа оплаты в МойКласс (Настройки → Способы оплаты)
- *   MOYKLASS_CASHBOX_ID        — (опционально) id кассы в МойКласс для платежей MKassa
+ *   MOYKLASS_PAYMENT_TYPE_ID   — (опционально) id типа оплаты в МойКласс; по умолчанию
+ *                                 116679 («ОнлайнОплата»), см. константу ниже
+ *   MOYKLASS_CASHBOX_ID        — (опционально) id кассы в МойКласс; по умолчанию
+ *                                 3289 («Касса Онлайн оплата»)
  *   MKASSA_DEFAULT_FILIAL_ID   — (опционально) filialId по умолчанию, если не передан в запросе
  *
  * Сумма платежа берётся не вручную, а из активного абонемента ученика
@@ -39,8 +41,11 @@ const path = require('path');
 const MKASSA_BASE = 'https://api.mkassa.kg/api/partners';
 const MKASSA_KEY = process.env.MKASSA_CASHIER_API_KEY;
 const MK_PAYMENTS_KEY = process.env.MOYKLASS_PAYMENTS_API_KEY;
-const MK_PAYMENT_TYPE_ID = process.env.MOYKLASS_PAYMENT_TYPE_ID;
-const MK_CASHBOX_ID = process.env.MOYKLASS_CASHBOX_ID;
+// Значения по умолчанию — «ОнлайнОплата» (тип оплаты) и «Касса Онлайн оплата»,
+// найдены через админ-панель 01.07.2026. Можно переопределить переменной
+// окружения на Railway, без изменения кода, если понадобится сменить.
+const MK_PAYMENT_TYPE_ID = process.env.MOYKLASS_PAYMENT_TYPE_ID || '116679';
+const MK_CASHBOX_ID = process.env.MOYKLASS_CASHBOX_ID || '3289';
 const DEFAULT_FILIAL_ID = process.env.MKASSA_DEFAULT_FILIAL_ID;
 
 const MK_AUTH_URL = 'https://api.moyklass.com/v1/company/auth/getToken';
