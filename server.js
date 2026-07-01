@@ -126,9 +126,15 @@ function cached(key, fn) {
 async function buildPortfolio(userId) {
   return cached(`portfolio:${userId}`, async () => {
 
-    // 1. Записи ученика в группах
-    const joinsRes = await mk('/joins', { userId: userId, limit: 50 });
-    const joins    = joinsRes.joins || [];
+    // 1. Записи ученика в группах + ФИО (независимые запросы — параллельно)
+    const [joinsRes, userRes] = await Promise.all([
+      mk('/joins', { userId: userId, limit: 50 }),
+      mk(`/users/${userId}`).catch(() => null), // ФИО не критично для остального портфолио
+    ]);
+    const joins = joinsRes.joins || [];
+
+    const userObj = Array.isArray(userRes) ? userRes[0] : userRes;
+    const name = userObj ? `${userObj.name || ''} ${userObj.surname || ''}`.trim() : '';
 
     // Найти активную группу (по дате последнего реального посещения)
     const withVisits = joins.filter(j => j.stats?.lastVisit);
@@ -209,6 +215,7 @@ async function buildPortfolio(userId) {
 
     return {
       userId,
+      name: name || null,
       level,
       levelProgress: levelProgress(level, avgMark),
       levelIndex:    LEVEL_ORDER.indexOf(level),
