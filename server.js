@@ -10,6 +10,7 @@ const axios   = require('axios');
 const crypto  = require('crypto');
 const fs      = require('fs');
 const path    = require('path');
+const registerMkassaRoutes = require('./mkassa');
 
 const app = express();
 app.use(cors());
@@ -559,6 +560,10 @@ app.get('/health', async (req, res) => {
     });
   }
 });
+
+// MKassa QR-платежи — отдельный МойКласс-ключ (MOYKLASS_PAYMENTS_API_KEY),
+// см. mkassa.js и mkassa-integration-plan.md
+registerMkassaRoutes(app, { DATA_DIR });
 
 app.listen(PORT, () =>
   console.log(`BE School Portfolio Backend running on :${PORT}`));

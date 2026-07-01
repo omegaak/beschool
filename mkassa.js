@@ -1,0 +1,296 @@
+/**
+ * MKassa (MBank) QR-платежи → МойКласс
+ *
+ * Использует ОТДЕЛЬНЫЙ МойКласс-ключ (MOYKLASS_PAYMENTS_API_KEY),
+ * чтобы не конкурировать за токен с основным ключом портфолио (MOYKLASS_API_KEY
+ * в server.js) — см. architecture-обсуждение и mkassa-integration-plan.md.
+ *
+ * ВАЖНО: в документации MKassa нет подписи/HMAC для коллбэка — коллбэку нельзя
+ * доверять напрямую. Поэтому при получении коллбэка мы всегда перепроверяем
+ * статус отдельным GET-запросом к MKassa своим же api-key, прежде чем
+ * зачислять платёж в МойКласс.
+ *
+ * Переменные окружения (задать на Railway):
+ *   MKASSA_CASHIER_API_KEY     — cashier api-key из личного кабинета MKassa
+ *   MOYKLASS_PAYMENTS_API_KEY  — отдельный company-level ключ МойКласс, только для платежей
+ *   MOYKLASS_PAYMENT_TYPE_ID   — id типа оплаты в МойКласс (Настройки → Способы оплаты)
+ *   MOYKLASS_CASHBOX_ID        — (опционально) id кассы в МойКласс для платежей MKassa
+ *   MKASSA_DEFAULT_FILIAL_ID   — (опционально) filialId по умолчанию, если не передан в запросе
+ *
+ * ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ MVP: /mkassa/create-payment сейчас не проверяет,
+ * что запрос пришёл от авторизованного родителя (в кабинете ещё нет parent-auth).
+ * До запуска в бой — обязательно повесить сюда проверку сессии родителя,
+ * иначе кто угодно сможет генерировать QR на чужого userId.
+ */
+
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+
+const MKASSA_BASE = 'https://api.mkassa.kg/api/partners';
+const MKASSA_KEY = process.env.MKASSA_CASHIER_API_KEY;
+const MK_PAYMENTS_KEY = process.env.MOYKLASS_PAYMENTS_API_KEY;
+const MK_PAYMENT_TYPE_ID = process.env.MOYKLASS_PAYMENT_TYPE_ID;
+const MK_CASHBOX_ID = process.env.MOYKLASS_CASHBOX_ID;
+const DEFAULT_FILIAL_ID = process.env.MKASSA_DEFAULT_FILIAL_ID;
+
+const MK_AUTH_URL = 'https://api.moyklass.com/v1/company/auth/getToken';
+const MK_PAYMENTS_URL = 'https://api.moyklass.com/v1/company/payments';
+
+// ─── Отдельный токен МойКласс для платежей (Payments key) ──────────────────
+let paymentsToken = null;
+let paymentsTokenPromise = null;
+
+async function getPaymentsToken() {
+  if (paymentsToken && paymentsToken.expiresAt > Date.now() + 60_000) {
+    return paymentsToken.accessToken;
+  }
+  if (paymentsTokenPromise) return paymentsTokenPromise;
+  if (!MK_PAYMENTS_KEY) {
+    throw new Error('MOYKLASS_PAYMENTS_API_KEY не задан в переменных окружения');
+  }
+  paymentsTokenPromise = axios.post(MK_AUTH_URL, { apiKey: MK_PAYMENTS_KEY }).then(r => {
+    const { accessToken, expiresAt } = r.data;
+    paymentsToken = {
+      accessToken,
+      expiresAt: expiresAt ? new Date(expiresAt).getTime() : Date.now() + 6 * 24 * 60 * 60 * 1000,
+    };
+    paymentsTokenPromise = null;
+    return accessToken;
+  }).catch(err => {
+    paymentsTokenPromise = null;
+    throw err;
+  });
+  return paymentsTokenPromise;
+}
+
+// ─── Клиент MKassa ───────────────────────────────────────────────────────────
+function mkassaHeaders() {
+  if (!MKASSA_KEY) throw new Error('MKASSA_CASHIER_API_KEY не задан в переменных окружения');
+  return { Authorization: `api-key ${MKASSA_KEY}`, 'Content-Type': 'application/json' };
+}
+
+async function createDynamicQr({ amountTyin, metadata }) {
+  const { data } = await axios.post(
+    `${MKASSA_BASE}/transactions/init_payment/`,
+    { amount: amountTyin, is_long_living: true, metadata },
+    { headers: mkassaHeaders() }
+  );
+  return data; // { id, status, payment_token, amount, ... }
+}
+
+async function getTransactionStatus(id) {
+  const { data } = await axios.get(
+    `${MKASSA_BASE}/transactions/${id}/`,
+    { headers: mkassaHeaders() }
+  );
+  return data;
+}
+
+async function cancelTransaction(id) {
+  const { data } = await axios.put(
+    `${MKASSA_BASE}/transactions/${id}/cancel/`,
+    {},
+    { headers: mkassaHeaders() }
+  );
+  return data;
+}
+
+// ─── Создание платежа в МойКласс (Payments key) ─────────────────────────────
+async function createMoyklassPayment({ userId, summa, userSubscriptionId, filialId, comment }) {
+  const token = await getPaymentsToken();
+  const body = {
+    optype: 'income',
+    userId,
+    date: new Date().toISOString().split('T')[0],
+    summa,
+    comment,
+  };
+  const resolvedFilialId = filialId || DEFAULT_FILIAL_ID;
+  if (resolvedFilialId) body.filialId = Number(resolvedFilialId);
+  if (userSubscriptionId) body.userSubscriptionId = Number(userSubscriptionId);
+  if (MK_PAYMENT_TYPE_ID) body.paymentTypeId = Number(MK_PAYMENT_TYPE_ID);
+  if (MK_CASHBOX_ID) body.cashboxId = Number(MK_CASHBOX_ID);
+
+  const { data } = await axios.post(MK_PAYMENTS_URL, body, {
+    headers: { 'x-access-token': token, 'Content-Type': 'application/json' },
+  });
+  return data;
+}
+
+// ─── Персистентное хранилище транзакций (переживает передеплой — см. паттерн
+// loadTeachers/saveTeachers в server.js, тот же DATA_DIR/Volume) ────────────
+function makeStore(dataDir) {
+  const dir = dataDir && fs.existsSync(dataDir) ? dataDir : '/tmp';
+  const file = path.join(dir, 'mkassa_transactions.json');
+
+  function load() {
+    try {
+      if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (e) { console.error('Не удалось прочитать mkassa_transactions.json:', e.message); }
+    return {};
+  }
+  function save(map) {
+    try { fs.writeFileSync(file, JSON.stringify(map, null, 2)); }
+    catch (e) { console.error('Не удалось сохранить mkassa_transactions.json:', e.message); }
+  }
+
+  let tx = load();
+  return {
+    get: (id) => tx[id],
+    set: (id, record) => { tx[id] = record; save(tx); },
+    all: () => tx,
+  };
+}
+
+// ─── Роуты ───────────────────────────────────────────────────────────────────
+function registerMkassaRoutes(app, { DATA_DIR } = {}) {
+  const store = makeStore(DATA_DIR);
+
+  // Родитель нажал «Оплатить» в кабинете — создаём динамический QR
+  app.post('/mkassa/create-payment', async (req, res) => {
+    try {
+      const { userId, amountSom, userSubscriptionId, filialId, comment } = req.body || {};
+      if (!userId || !amountSom) {
+        return res.status(400).json({ ok: false, error: 'Нужны userId и amountSom' });
+      }
+      const amountTyin = Math.round(Number(amountSom) * 100);
+
+      const metadata = {
+        key1: String(userId),
+        key2: userSubscriptionId ? String(userSubscriptionId) : '',
+        key3: filialId ? String(filialId) : '',
+        key4: '',
+        key5: comment ? String(comment).slice(0, 150) : '',
+      };
+
+      const mkassaTx = await createDynamicQr({ amountTyin, metadata });
+
+      store.set(mkassaTx.id, {
+        id: mkassaTx.id,
+        userId: Number(userId),
+        userSubscriptionId: userSubscriptionId ? Number(userSubscriptionId) : null,
+        filialId: filialId ? Number(filialId) : null,
+        amountSom: Number(amountSom),
+        amountTyin,
+        comment: comment || null,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+        paidAt: null,
+        moyklassPaymentId: null,
+      });
+
+      res.json({
+        ok: true,
+        data: {
+          id: mkassaTx.id,
+          paymentToken: mkassaTx.payment_token,
+          amountSom: Number(amountSom),
+          status: mkassaTx.status,
+        },
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
+    }
+  });
+
+  // Фронтенд опрашивает статус, пока показывает QR
+  app.get('/mkassa/status/:id', async (req, res) => {
+    const record = store.get(req.params.id);
+    if (!record) return res.status(404).json({ ok: false, error: 'Транзакция не найдена' });
+    res.json({ ok: true, data: { status: record.status, paidAt: record.paidAt } });
+  });
+
+  // Отмена QR до оплаты (например, родитель закрыл модалку)
+  app.post('/mkassa/cancel/:id', async (req, res) => {
+    try {
+      const record = store.get(req.params.id);
+      if (!record) return res.status(404).json({ ok: false, error: 'Транзакция не найдена' });
+      if (record.status === 'pending') {
+        await cancelTransaction(req.params.id).catch(() => {});
+        store.set(req.params.id, { ...record, status: 'canceled' });
+      }
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // Коллбэк от MKassa. НЕ доверяем телу запроса — только используем как триггер
+  // и перепроверяем статус отдельным GET-запросом своим же api-key.
+  app.post('/mkassa/callback', async (req, res) => {
+    // Всегда отвечаем 200 — иначе MKassa будет бесконечно ретраить из-за наших внутренних ошибок
+    res.status(200).json({ ok: true });
+
+    try {
+      const id = req.body?.id;
+      if (!id) return;
+
+      const record = store.get(id);
+      if (!record) {
+        console.warn(`MKassa callback: неизвестная транзакция ${id}`);
+        return;
+      }
+      if (record.status === 'paid') return; // идемпотентность
+
+      const fresh = await getTransactionStatus(id);
+      if (fresh.status !== 'paid') {
+        store.set(id, { ...record, status: fresh.status });
+        return;
+      }
+      if (Number(fresh.amount) !== Number(record.amountTyin)) {
+        console.error(`MKassa: несовпадение суммы для ${id}: ожидали ${record.amountTyin}, получили ${fresh.amount}`);
+        store.set(id, { ...record, status: 'amount_mismatch' });
+        return;
+      }
+
+      const payment = await createMoyklassPayment({
+        userId: record.userId,
+        summa: record.amountSom,
+        userSubscriptionId: record.userSubscriptionId,
+        filialId: record.filialId,
+        comment: `MKassa QR, tx ${id}${record.comment ? ' — ' + record.comment : ''}`,
+      });
+
+      store.set(id, {
+        ...record,
+        status: 'paid',
+        paidAt: fresh.paid_at || new Date().toISOString(),
+        moyklassPaymentId: payment.id,
+      });
+      console.log(`MKassa: платёж ${id} зачислен в МойКласс, paymentId=${payment.id}`);
+    } catch (e) {
+      console.error('MKassa callback error:', e.message, e.response?.data || '');
+    }
+  });
+
+  // Ручная сверка на случай, если коллбэк не пришёл (можно дёргать по крону раз в минуту)
+  app.post('/mkassa/recheck/:id', async (req, res) => {
+    try {
+      const record = store.get(req.params.id);
+      if (!record) return res.status(404).json({ ok: false, error: 'Транзакция не найдена' });
+      if (record.status === 'paid') return res.json({ ok: true, data: record });
+
+      const fresh = await getTransactionStatus(req.params.id);
+      if (fresh.status === 'paid' && Number(fresh.amount) === Number(record.amountTyin)) {
+        const payment = await createMoyklassPayment({
+          userId: record.userId,
+          summa: record.amountSom,
+          userSubscriptionId: record.userSubscriptionId,
+          filialId: record.filialId,
+          comment: `MKassa QR, tx ${req.params.id}${record.comment ? ' — ' + record.comment : ''}`,
+        });
+        store.set(req.params.id, {
+          ...record, status: 'paid', paidAt: fresh.paid_at || new Date().toISOString(), moyklassPaymentId: payment.id,
+        });
+      } else {
+        store.set(req.params.id, { ...record, status: fresh.status });
+      }
+      res.json({ ok: true, data: store.get(req.params.id) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
+    }
+  });
+}
+
+module.exports = registerMkassaRoutes;
