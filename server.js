@@ -213,6 +213,26 @@ async function buildPortfolio(userId) {
       ? Math.round(hwRecords.reduce((s, r) => s + r.homeMark, 0) / hwRecords.length)
       : null;
 
+    // 6. Геймификация — считаем на реальных данных, ничего не выдумываем:
+    // серия уроков подряд без пропуска (актуальнее «дней подряд» при графике
+    // 2 раза в неделю), очки опыта (10 за посещённый урок + 5 за урок с оценкой)
+    // и значки за достижения.
+    const chronological = records.slice().sort((a, b) => a.id - b.id);
+    let streakLessons = 0;
+    for (let i = chronological.length - 1; i >= 0; i--) {
+      if (chronological[i].visit) streakLessons++;
+      else break;
+    }
+
+    const xp = visited.length * 10 + withMark.length * 5;
+    const topMark = withMark.length ? Math.max(...withMark.map(r => r.lessonMark)) : null;
+
+    const badges = [
+      { id: 'streak',  label: 'Уроков подряд', icon: 'flame',    value: streakLessons, earned: streakLessons >= 5 },
+      { id: 'perfect', label: 'Без пропусков', icon: 'checkbox', value: null,          earned: records.length > 0 && attend === 100 },
+      { id: 'top',     label: 'Топ результат', icon: 'star',     value: topMark,       earned: topMark != null && topMark >= 90 },
+    ];
+
     return {
       userId,
       name: name || null,
@@ -226,6 +246,7 @@ async function buildPortfolio(userId) {
       hwAvg,
       skills,            // { Grammar: 85, Reading: 90, ... } — только если ≥3 оценок
       recentLessons,
+      gamification: { xp, streakLessons, badges },
       classId,
       courseId,
       lastSync:      new Date().toISOString(),
