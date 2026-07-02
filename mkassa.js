@@ -190,7 +190,11 @@ function makeStore(dataDir) {
 }
 
 // ─── Роуты ───────────────────────────────────────────────────────────────────
-function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {}, checkStudentAccess = () => ({ ok: true }) } = {}) {
+function registerMkassaRoutes(app, {
+  DATA_DIR, courseLevels = {},
+  checkStudentAccess = () => ({ ok: true }),
+  requireAdmin = (req, res, next) => next(), // если не передали — не блокируем (обратная совместимость)
+} = {}) {
   const store = makeStore(DATA_DIR);
 
   // Активные абонементы ученика — фронтенд показывает их вместо того, чтобы
@@ -377,8 +381,10 @@ function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {}, checkStudentAc
     }
   });
 
-  // Ручная сверка на случай, если коллбэк не пришёл (можно дёргать по крону раз в минуту)
-  app.post('/mkassa/recheck/:id', async (req, res) => {
+  // Ручная сверка на случай, если коллбэк не пришёл (доступна из админки —
+  // кнопка "Сверить оплату"). Защищена паролем администратора, т.к. дёргает
+  // реальное зачисление в МойКласс.
+  app.post('/mkassa/recheck/:id', requireAdmin, async (req, res) => {
     try {
       const record = store.get(req.params.id);
       if (!record) return res.status(404).json({ ok: false, error: 'Транзакция не найдена' });
@@ -403,6 +409,17 @@ function registerMkassaRoutes(app, { DATA_DIR, courseLevels = {}, checkStudentAc
     } catch (e) {
       res.status(500).json({ ok: false, error: e.message, detail: e.response?.data || null });
     }
+  });
+
+  // Список последних транзакций — чтобы в админке не пришлось искать ID
+  // транзакции вручную (например, в личном кабинете arm.mkassa.kg), особенно
+  // для "зависших" pending-платежей, которые оплачены в банке, но не пришёл
+  // коллбэк (см. кнопку "Сверить" рядом с каждой транзакцией).
+  app.get('/admin/mkassa/transactions', requireAdmin, (req, res) => {
+    const all = Object.values(store.all())
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 50);
+    res.json({ ok: true, data: all });
   });
 }
 

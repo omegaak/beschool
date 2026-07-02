@@ -788,7 +788,7 @@ app.get('/health', async (req, res) => {
 const MKASSA_ENABLED = process.env.MKASSA_ENABLED !== 'false';
 
 if (MKASSA_ENABLED) {
-  registerMkassaRoutes(app, { DATA_DIR, courseLevels: COURSE_LEVELS, checkStudentAccess });
+  registerMkassaRoutes(app, { DATA_DIR, courseLevels: COURSE_LEVELS, checkStudentAccess, requireAdmin });
   console.log('MKassa: модуль оплаты включён');
 } else {
   console.log('MKassa: модуль оплаты отключён (MKASSA_ENABLED=false)');
